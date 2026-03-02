@@ -1,0 +1,536 @@
+---
+title: "Assignment-01"
+author: "Md Samiul Hauque Chowdhury"
+date: "04-05-2025"
+format:
+  pdf:
+    documentclass: article
+    number-sections: false
+    toc: false
+    toc-depth: 1
+    code-overflow: wrap
+    keep-tex: true
+    include-in-header: preamble.tex
+    fig-cap-location: top
+    tbl-cap-location: top
+fontsize: 11pt
+geometry: margin=1in
+bibliography: citations.bib
+link-citations: true
+csl: ieee.csl
+editor: visual
+---
+
+## 1. Dataset and Scenario Description
+
+This dataset is originally from the National Institute of Diabetes and Digestive and Kidney Diseases.[@kaggle2024diabetes]. It includes various health-related attributes of female patients, and a binary outcome indicating the presence or absence of diabetes. Our objective is to find how BMI leads a female person towards diabetes.
+
+**`Key variables used:`**
+
+-   Pregnancies: Number of times pregnant.
+
+-   Glucose: Plasma glucose concentration after a 2-hour oral glucose tolerance test.
+
+-   BloodPressure: Diastolic blood pressure (mm Hg).
+
+-   SkinThickness: Triceps skin fold thickness (mm).
+
+-   Insulin: 2-hour serum insulin (mu U/ml).
+
+-   BMI: Body mass index (computed as weight (kg)/height (m)2).
+
+-   DiabetesPedigreeFunction: Diabetes pedigree function.
+
+-   Age: Age (in years).
+
+-   Outcome: Diagnosis result (1 for diabetic, 0 for non-diabetic)
+
+Unfortunately one important variable is missing here which is commonly refer in case of Diabetes is "Dietary Habbits". Hence with the help of some AI Agent we simulated another column Dietary Habbit which specifies 1=Good, 2=Moderate, 3=Poor.
+
+```{r}
+# Load required packages
+library(dplyr)
+library(readr)
+
+# STEP 1: Load the dataset
+df <- read_csv("diabetes.csv")
+
+# STEP 2: Simulate 'DH' (Dietary Health) based on only BMI and Glc
+set.seed(42)
+
+simulate_dh <- function(bmi, glc) {
+  if (is.na(bmi) | is.na(glc)) {
+    return(NA)
+  } else if (bmi > 35 | glc > 150) {
+    return(sample(c(2, 3), 1, prob = c(0.3, 0.7)))
+  } else if (bmi < 25 & glc < 100) {
+    return(sample(c(1, 2), 1, prob = c(0.7, 0.3)))
+  } else {
+    return(sample(c(1, 2, 3), 1, prob = c(0.3, 0.4, 0.3)))
+  }
+}
+
+
+# STEP 4: Save the updated dataset
+write_csv(df, "diabetes.csv")
+
+# STEP 5: Show the first 5 rows
+head(df, 5)
+
+
+
+```
+
+### Key Questions:
+
+1.  Does BMI have a causal effect on diabetes for female patients?
+2.  How other important variables (Pregnancy, Age, Blood Pressure) influence our T= BMI and Y=diabetes?
+3.  What are the significant mediators, con-founders and potential con-founders.
+
+## 2. Developing a Graphical Causal Model (DAG)
+
+```{r}
+
+# Load libraries
+library(tidyverse)
+library(ggdag)
+library(dagitty)
+library(broom)
+
+# Adjusted node layout for better spacing (preserved)
+node_details <- tribble(
+  ~name, ~label, ~x, ~y,
+  "DH", "Diet", 2, 10,
+  "BMI", "BMI", 1, 6,
+  "BP", "BP", 6, 4,
+  "Ins", "Insulin", 9, 8,
+  "Glc", "Glc", 13, 4,
+  "Diabetes", "Diabetes", 15, 7,
+  "DPF", "DPF", 7, 10,
+  "Age", "Age", 5, 10,
+  "PREG", "Pregnancies", 2, 4,
+  "ST", "SKinT", 13, 10
+)
+
+# Attach readable labels
+node_labels <- node_details$label
+names(node_labels) <- node_details$name
+
+# Define DAG with treatment and outcome properly set
+dag1 <- dagify(
+  BMI ~ Age + PREG +DH ,
+  BP ~ DH + Age + BMI + PREG,
+  Ins ~ BP + BMI + PREG + DPF,
+  Glc ~ Ins +DH,
+  Diabetes ~ Glc,
+  
+  ST ~ Age + Ins,
+  
+  
+  
+  exposure = "BMI",        
+  outcome  = "Diabetes",    
+  coords = node_details,
+  labels = node_labels
+)
+
+# Tidy DAG and automatically assign status (exposure, outcome, latent)
+dag_tidy <- dag1 %>%
+  tidy_dagitty() %>%
+  node_status()
+
+# Define color scheme (orange for exposure, teal for outcome)
+status_colors <- c(
+  exposure = "#005e73",  # BMI
+  outcome  = "#FF7E15",  # Diabetes
+  latent   = "grey50"
+)
+
+# Final DAG plot
+ggplot(dag_tidy, aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_dag_point(aes(color = status)) +
+  geom_dag_edges() +
+  geom_dag_label_repel(
+    aes(label = label, fill = status),
+    size          = 2.5,
+    seed          = 1234,
+    color         = "white",
+    fontface      = "bold",
+    point.padding = unit(0.6, "lines"),
+    box.padding   = unit(0.6, "lines"),
+    nudge_y       = 1
+  ) +
+  scale_color_manual(values = status_colors, na.value = "#00C1D4") +
+  scale_fill_manual(values = status_colors, na.value = "#00C1D4") +
+  guides(color = "none", fill = "none") +
+  theme_dag()
+
+
+
+
+```
+
+### Explanations & Justifications of Important DAG relationship
+
+### **Confounders**
+
+**Age → Blood Pressure, Age → Skin Thickness** and **Age → BMI**,:\
+Physiological changes associated with aging—such as arterial stiffening and reduced vascular compliance—lead to progressive increases in systolic blood pressure, particularly isolated systolic hypertension in older adults.[@singh2023bp]
+
+**Pregnancies → BMI, Pregnancies →Blood Pressure and Pregnancies →Insulin**:\
+The number of pregnancies can affect body weight and long-term metabolic changes, influencing insulin resistance and blood pressure. Gestational diabetes describes how pregnancy is directly relation to insulin resistance and eventually diabetes. [@slootweg2023maternal]
+
+**Diabetes Pedigree Function (DPF) → Insulin**:\
+DPF approximates a person's genetic susceptibility to diabetes. This family/genetic background can influence intermediate physiological variables like insulin sensitivity.
+
+### **Potential Confounders**
+
+**Dietary Habit → BMI** and **Dietary Habit → Blood Pressure**:\
+People with unhealthy dietary habits—like eating fatty, salty foods—are more likely to gain weight and develop high blood pressure. Over time, this can lead to insulin resistance and increase the risk of type 2 diabetes. [@li2024hypertension]
+
+### **Mediators**
+
+**BMI → Blood Pressure → Insulin → Glucose → Diabetes**:\
+Excess body fat triggers the kidneys and hormones to raise blood pressure, also making the body less responsive to insulin and increasing nervous system activity. This leads to higher blood sugar levels and can cause diabetes. [@kalandarova2024diet] [@hall2015obesity]
+
+**Insulin → Skin Thickness** :\
+According to a study, a small amount of insulin can cause increased skin thickness. [@murao2022insulin]
+
+## 3. Causal Discovery
+
+```{r pc-graph, message=FALSE, warning=FALSE, results='hide'}
+
+# Load required libraries
+library(tidyverse)
+library(pcalg)
+library(graph)
+library(RBGL)
+
+# STEP 1: Read the cleaned and overwritten dataset
+diabetes <- read_csv("diabetes.csv")  # no renaming needed
+
+# STEP 2: Subset variables for DAG learning
+vars <- c("Age", "BMI", "BP", "Glc", "Ins", "Out", "DPF", "Preg", "Skin", "DH")
+df <- diabetes[, vars]
+
+# STEP 3: Ensure all variables are numeric (for correlation matrix)
+df <- df %>% mutate(across(everything(), as.numeric))
+
+# STEP 4: Create sufficient statistics for Gaussian CI test
+suffStat <- list(C = cor(df), n = nrow(df))
+
+# STEP 5: Apply the PC algorithm
+pc.fit <- pc(
+  suffStat = suffStat,
+  indepTest = gaussCItest,
+  alpha = 0.05,
+  labels = colnames(df),
+  verbose = TRUE
+)
+
+# STEP 6: Plot the learned CPDAG
+plot(pc.fit, main = "Simplified Causal Graph")
+
+
+
+```
+
+After DAG simplifications a few edges were omitted. A new **bidirectional** edge has been introduced with pregnancy to age. Importantly, a new edge is visible from our **treatment(BMI)** to **outcome(Diabetes)**. Same goes for pregnancy to outcome. In our original DAG a relation between **Diabetes** to DPF(**Diabetes Pedigree Function)** is missing.
+
+However, we can draw a new DAG based on the result given from PcAlgorithm.
+
+### DAG Simplifications
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(ggdag)
+library(dagitty)
+library(broom)
+
+# Node layout with labels
+node_details <- tribble(
+  ~name, ~label, ~x, ~y,
+  "DH", "Diet", 2, 10,
+  "BMI", "BMI", 1, 6,
+  "BP", "BP", 6, 4,
+  "Ins", "Insulin", 9, 8,
+  "Glc", "Glc", 13, 4,
+  "Diabetes", "Diabetes", 15, 7,
+  "DPF", "DPF", 7, 10,
+  "Age", "Age", 5, 10,
+  "PREG", "Pregnancies", 2, 4,
+  "ST", "SKinT", 13, 10
+)
+
+# Attach readable labels
+node_labels <- node_details$label
+names(node_labels) <- node_details$name
+
+# Define DAG (fixed node names + correct labels/coords)
+dagSim <- dagify(
+  ST ~ BP + BMI + DPF + Ins + Age,
+  Diabetes ~ BMI + PREG + Glc,
+  DH ~ BMI  + Glc,
+  Glc ~ Age,
+  Ins ~ Glc,
+  PREG ~ Age,
+  BP ~ Age + BMI,
+  Age ~ PREG,
+  DPF ~ Ins+Diabetes,
+  
+  exposure = "BMI",
+  outcome = "Diabetes",
+  
+  coords = node_details,
+  labels = node_labels
+)
+
+# Tidy DAG and mark node roles
+dag_tidy <- dagSim %>%
+  tidy_dagitty() %>%
+  node_status()
+
+# Define colors
+status_colors <- c(
+  exposure = "#005e73",  # Dark teal for exposure
+  outcome  = "#FF7E15",  # Orange for outcome
+  latent   = "grey50"
+)
+
+# Final plot
+ggplot(dag_tidy, aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_dag_point(aes(color = status)) +
+  geom_dag_edges() +
+  geom_dag_label_repel(
+    aes(label = label, fill = status),
+    size = 2.5,
+    seed = 1234,
+    color = "white",
+    fontface = "bold",
+    point.padding = unit(0.6, "lines"),
+    box.padding = unit(0.6, "lines"),
+    nudge_y = 1
+  ) +
+  scale_color_manual(values = status_colors, na.value = "#00C1D4") +
+  scale_fill_manual(values = status_colors, na.value = "#00C1D4") +
+  guides(color = "none", fill = "none") +
+  theme_dag()
+
+
+```
+
+## 4. Identifications of Causal Effects
+
+In order to do the identifications of causal effects, we must execute backdoor criterion, frontdoor criterion and do -calculus.
+
+### Backdoor Adjustment
+
+So the minimum adjustment set for our initial graph is below:
+
+```{r}
+adjustmentSets(dag1, exposure = "BMI", outcome="Diabetes")
+```
+
+We must need to condition on Age and pregnancy in order to validate our causal relation from BMI to Diabetes. For example, older individuals tend to have higher BMI and are also more likely to develop diabetes.
+
+**Collider Check**: We must need to careful about collider, as conditioning on ***Insulin*** will open new backdoor paths. Although Insulin here acts a potential collider.
+
+```{r}
+isAdjustmentSet(dag1, c("Age", "DH", "PREG", "Ins"), exposure="BMI", outcome="Diabetes")
+```
+
+On the other hand, our simplified DAG, minimal adjustment set is:
+
+```{r}
+adjustmentSets(dagSim, exposure ="BMI", outcome= "Diabetes")
+```
+
+We don't need to condition on **any variable** in case of our simplified DAG. But we must need to be careful about collider and not condition them.
+
+### Frontdoor Adjustment
+
+[**Condition 1**]{.underline}
+
+**Original DAG:**
+
+After blocking all the backdoor path we can see 2 set of mediating path,
+
+1.  BMI → Insulin → Glucose → Diabetes
+2.  BMI → BP → Insulin → Glucose → Diabetes
+
+BMI is direclty mediating through mediator variables and causing diabetes **satisfy the 1st condition**.
+
+**Simplified DAG:**
+
+There is a direct edge from BMI to Diabetes. Hence there is no mediator between them and **does not satisfy** the 1st condition. Although theoretically BMI is not a direct reason for diabetes. It must need to have an influential relation with insulin resistance. [@klein2019obesity]
+
+[**Condition 2**]{.underline}
+
+**Original DAG:**
+
+There should not be any unblocked backdoor paths from BMI to Mediators thus second condition does not met.
+
+```{r}
+adjustmentSets(dag1, exposure = "BMI", outcome="Glc")
+```
+
+```{r}
+adjustmentSets(dag1, exposure = "BMI", outcome="Ins")
+```
+
+```{r}
+adjustmentSets(dag1, exposure = "BMI", outcome="BP")
+```
+
+**Simplified DAG:**
+
+```{r}
+#adjustmentSets(dagSim, exposure = "BMI", outcome="")
+```
+
+Obviously simplified DAG will not satisfy the 2nd condition as there is no mediator.
+
+[**Condition 3**]{.underline}
+
+**Original DAG:**
+
+All backdoor paths from Mediators to Outcome need to be blocked my BMI. Hence 3rd condition does not met.
+
+```{r}
+adjustmentSets(dag1, exposure = "Ins", outcome="Diabetes")
+```
+
+```{r}
+adjustmentSets(dag1, exposure = "BP", outcome="Diabetes")
+```
+
+```{r}
+adjustmentSets(dag1, exposure = "Glc", outcome="Diabetes")
+```
+
+**Simplified DAG:**
+
+There is no mediator here to execute so this DAG failed here as well.
+
+### do-calculus
+
+**Original DAG:**
+
+```{r}
+library(dosearch)
+
+dag_do <- "
+  Age -> BMI
+  PREG -> BMI
+  DH -> BMI
+  
+  DH -> BP
+  Age -> BP
+  BMI -> BP
+  PREG -> BP
+
+  BP -> Ins
+  BMI -> Ins
+  PREG -> Ins
+  DPF -> Ins
+
+  Ins -> Glc
+  DH -> Glc
+
+  Glc -> Diabetes
+
+  Age -> ST
+  Ins -> ST
+"
+
+# All observed variables (assuming no hidden variables for now)
+data_str <- "P(Age, PREG, DH, DPF, BMI, BP, Ins, Glc, Diabetes, ST)"
+
+# The query of interest: effect of BMI on Diabetes
+query <- "P(Diabetes | do(BMI))"
+
+# Run do-search
+res <- dosearch(data_str, query, dag_do)
+
+# Check identifiability
+is_identifiable(res)
+
+# If identifiable, see the formula
+res$formula
+
+```
+
+```{r}
+get_derivation(res)
+```
+
+```{r}
+cat(res$formula)
+
+```
+
+Expression for original DAG:
+
+$$
+ \sum_{\text{Age}, \text{PREG}, \text{DH}, \text{DPF}} \left[ P(\text{Age}, \text{PREG}, \text{DH}, \text{DPF}) \cdot P(\text{Diabetes} \mid \text{BMI}, \text{Age}, \text{PREG}, \text{DH}, \text{DPF}) \right]
+$$
+
+**Simplified DAG:**
+
+```{r}
+library(dosearch)
+
+# Query and DAG
+new_query <- "P(Diabetes | do(BMI))"
+dag_code <- "
+  Age -> BMI
+  PREG -> BMI
+  DH -> BMI
+  BMI -> BP
+  BMI -> Ins
+  BP -> Ins
+  PREG -> Ins
+  DPF -> Ins
+  Ins -> Glc
+  DH -> Glc
+  Glc -> Diabetes
+  Age -> ST
+  Ins -> ST
+"
+data_str <- "P(Age, PREG, DH, BMI, BP, Ins, Glc, Diabetes, DPF, ST)"
+
+# Run do-search
+res2 <- dosearch(data_str, new_query, dag_code)
+
+# Check identifiability
+is_identifiable(res2)
+
+# Correct way to view formula
+cat("Derived formula:\n", deparse(res2$formula), sep = "\n")
+
+
+```
+
+```{r}
+get_derivation(res)
+```
+
+```{r}
+cat(res2$formula)
+```
+
+Expression for Simplified DAG:
+
+$$
+\sum_{\text{Age}, \text{PREG}, \text{DH}, \text{DPF}} \left( p(\text{Age}, \text{PREG}, \text{DH}, \text{DPF}) \cdot p(\text{Diabetes} \mid \text{BMI}, \text{Age}, \text{PREG}, \text{DH}, \text{DPF}) \right)
+$$
+
+## 5. Reflection and critical evaluation
+
+In this assignment, we investigated the causal relationship between BMI and the risk of developing diabetes using a combination of domain knowledge and methods of Causal Discovery. We identified and blocked backdoor paths through proper adjustment (e.g., Age, Dietary Habit, Pregnancy) and confirmed identifiability using the dosearch algorithm. We found that BMI mediates its effect on Diabetes through Blood Pressure, Insulin, and Glucose. Although in our simplified graph we didn't find any adjustment set and interestingly there was a direct (T-\>Y) makes frontdoor calculation more complex. Despite structural variations in DAGs, the causal formula remained consistent.
+
+## 6. Reference
+
+::: {#refs}
+:::

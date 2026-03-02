@@ -1,0 +1,734 @@
+---
+title: "Double ML & Heterogeneous Treatment Effects"
+author: "MD SAMIUL HAUQUE CHOWDHURY"
+format:
+  pdf:
+    toc: true           
+    toc-depth: 2        
+    number-sections: true
+editor: visual
+---
+
+## 1. **Double ML & Heterogeneous Treatment Effects**
+
+### Data Set Description
+
+```{r}
+df <- read.csv("data_fitness_het.csv")
+
+head(df, 5)
+```
+
+### Partial Linear Model
+
+```{r}
+# Load required packages
+library(hdm)
+library(mlr3)
+library(mlr3learners)
+library(tidyverse)
+
+set.seed(1234) # for replicability
+
+# Outcome and Treatment
+Y <- df$engagement
+D <- df$notification_sent
+
+# Create folds for cross-fitting
+N <- nrow(df)
+nfolds <- 5
+fold <- sample(1:nfolds, N, replace = TRUE)
+
+# Initialize nuisance parameter vectors
+ehat <- rep(NA, N)      # Propensity score
+muhat <- rep(NA, N)     # Outcome model prediction
+
+# Define task and learner for the treatment model (propensity score)
+task_e <- as_task_classif(df |> select(-engagement), target = "notification_sent")
+lrnr_e <- lrn("classif.ranger", predict_type = "prob")
+
+# Define task and learner for the outcome model
+task_mu <- as_task_regr(df |> select(-notification_sent), target = "engagement")
+lrnr_mu <- lrn("regr.ranger", predict_type = "response")
+
+# Cross-fitting to estimate nuisance functions
+for (i in 1:nfolds) {
+  train_idx <- which(fold != i)
+  test_idx  <- which(fold == i)
+
+  # Fit propensity score model
+  lrnr_e$train(task_e, row_ids = train_idx)
+  ehat[test_idx] <- lrnr_e$predict(task_e, row_ids = test_idx)$prob[, 2]
+
+  # Fit outcome model
+  lrnr_mu$train(task_mu, row_ids = train_idx)
+  muhat[test_idx] <- lrnr_mu$predict(task_mu, row_ids = test_idx)$response
+}
+
+# Compute residuals
+res_y <- Y - muhat
+ATE   <- D - ehat   
+
+
+# Final residual-on-residual regression
+# The coefficient on ATE is the estimated Average Treatment Effect (ATE)
+dml_result <- lm(res_y ~ ATE)
+summary(dml_result)
+
+
+
+
+```
+
+We can see a **5.578minutes** of average engagement increase after sending notifications to the users. We can see the P-value and standard error is pretty small hence the result is pretty significant.
+
+## 2. **ATE of Notification Sent via Double ML (AIPW Model)**
+
+```{r}
+library(hdm)
+library(mlr3)
+library(mlr3learners)
+library(tidyverse)
+library(dplyr)
+
+set.seed(1234)
+
+# --- Define target & treatment ---
+Y_var <- "engagement"
+T_var <- "notification_sent"
+
+# --- Make sure X_vars is a character vector of column NAMES ---
+X_vars <- setdiff(names(df), c(Y_var, T_var, "row_id"))
+
+# Cross-fitting setup
+N      <- nrow(df)
+nfolds <- 5
+fold   <- sample(1:nfolds, N, replace = TRUE)
+
+# Prepare storage for nuisance estimates
+ehat    <- numeric(N)
+muhat0  <- numeric(N)
+muhat1  <- numeric(N)
+
+df$row_id <- seq_len(N)
+task_e    <- as_task_classif(df %>% select(all_of(c(X_vars, T_var))), target = T_var)
+task_mu   <- as_task_regr(   df %>% select(all_of(c(X_vars, Y_var))), target = Y_var)
+
+lrnr_e  <- lrn("classif.ranger",  predict_type = "prob",     num.trees = 500)
+lrnr_mu <- lrn("regr.ranger",      predict_type = "response", num.trees = 500)
+
+# --- 3. Cross-fitting of nuisance parameters ---
+for (i in seq_len(nfolds)) {
+  train_idx   <- which(fold != i)
+  predict_idx <- which(fold == i)
+
+  train_ids   <- df$row_id[train_idx]
+  pred_ids    <- df$row_id[predict_idx]
+
+  # 1) Propensity score e(x)
+  lrnr_e$train(task_e, row_ids = train_ids)
+  ehat[predict_idx] <- lrnr_e$predict(task_e, row_ids = pred_ids)$prob[, 2]
+
+  # 2) Outcome mu(0, x)
+  lrnr_mu$train(
+    task_mu,
+    row_ids = intersect(train_ids, which(df[[T_var]] == 0))
+  )
+  muhat0[predict_idx] <- lrnr_mu$predict(task_mu, row_ids = pred_ids)$response
+
+  # 3) Outcome mu(1, x)
+  lrnr_mu$train(
+    task_mu,
+    row_ids = intersect(train_ids, which(df[[T_var]] == 1))
+  )
+  muhat1[predict_idx] <- lrnr_mu$predict(task_mu, row_ids = pred_ids)$response
+}
+
+# --- DML-AIPW Estimation ---
+# Trim propensity scores to avoid extreme values
+eps <- 0.01
+ehat <- pmin(pmax(ehat, eps), 1 - eps)
+
+psi_a_aipw <- rep(-1, N)
+psi_b_aipw <- (muhat1 - muhat0) +
+  df[[T_var]] * (df[[Y_var]] - muhat1) / ehat -
+  (1 - df[[T_var]]) * (df[[Y_var]] - muhat0) / (1 - ehat)
+
+# Point estimate
+theta_aipw <- -sum(psi_b_aipw) / sum(psi_a_aipw)
+
+# Influence function for ATE (psi_i = psi_b_i - theta * psi_a_i)
+psi_if <- psi_b_aipw - theta_aipw * psi_a_aipw
+
+# Standard error: sample standard deviation of influence function / sqrt(N)
+se_aipw <- sd(psi_if) / sqrt(N)
+
+t_aipw <- theta_aipw / se_aipw
+p_aipw <- 2 * pt(abs(t_aipw), df = N - 1, lower.tail = FALSE)
+
+# --- AIPW Results (4 decimal places, non-scientific) ---
+cat("AIPW Results::\n")
+cat(sprintf("Estimate: %.4f\n", theta_aipw))
+cat(sprintf("Std_Error: %.4f\n", se_aipw))
+cat(sprintf("t_value: %.4f\n", t_aipw))
+cat(sprintf("p_value: %.4f\n", p_aipw))
+
+
+
+```
+
+After AIPW modeling sending notification to users increases 5.55 minutes average engagement with a higher t_value and pretty lower standard error. Interestingly the p_value is 0, overall makes our effect robust.
+
+## 3. **Verification with `DoubleML` Package**
+
+```{r}
+# Load package
+library(DoubleML)
+
+# Specify data object
+fit_life_dml <- DoubleMLData$new(
+  data = as.data.frame(df),
+  y_col = "notification_sent", 
+  d_cols = "engagement"
+  )
+```
+
+```{r}
+# Load necessary packages
+library(DoubleML)
+library(mlr3)
+library(mlr3learners)
+library(DoubleML)
+
+df <- read.csv("data_fitness_het.csv")
+
+fit_life_dml <- DoubleMLData$new(
+  data = df,
+  y_col = "engagement",             # outcome
+  d_cols = "notification_sent"      # treatment 
+)
+
+# Step 2: Specify learners for outcome and treatment models
+lrnr_m <- lrn("regr.ranger", num.trees = 100)  # ml_l: outcome model (Y ~ X)
+lrnr_e <- lrn("regr.ranger", num.trees = 100)  # ml_m: treatment model (D ~ X)
+
+# Step 3: Create DML-PLR estimator object
+dml_plr_obj <- DoubleMLPLR$new(
+  data = fit_life_dml,
+  ml_l = lrnr_m,                  # outcome model
+  ml_m = lrnr_e,                  # treatment model
+  apply_cross_fitting = TRUE,
+  n_folds = 5                    # 5-fold cross-fitting
+)
+
+# Step 4: Fit the model and summarize results
+dml_plr_obj$fit()
+dml_plr_obj$summary()
+
+```
+
+```{r}
+library(DoubleML)
+library(mlr3)
+library(mlr3learners)
+
+library(DoubleML)
+
+df <- read.csv("data_fitness_het.csv")
+
+fit_life_dml <- DoubleMLData$new(
+  data = df,
+  y_col = "engagement",             # outcome
+  d_cols = "notification_sent"      # treatment 
+)
+
+# Step 2: Define learners
+lrnr_g <- lrn("regr.ranger", num.trees = 100)     # Outcome model
+lrnr_m <- lrn("classif.ranger", num.trees = 100, predict_type = "prob")  # Propensity score model
+
+# Step 3: DoubleMLIRM model
+dml_irm_obj <- DoubleMLIRM$new(
+  data = fit_life_dml,
+  ml_g = lrnr_g,
+  ml_m = lrnr_m,
+  apply_cross_fitting = TRUE,
+  n_folds = 5
+)
+
+# Step 4: Fit and summarize
+dml_irm_obj$fit()
+dml_irm_obj$summary()
+
+```
+
+### Visualization
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(ggplot2)
+library(broom)
+
+# --- Manual PLR results (Task 1) 
+plr_est <- coef(dml_result)["ATE"]
+plr_se <- summary(dml_result)$coefficients["ATE", "Std. Error"]
+
+# --- Manual AIPW results (Task 2) 
+aipw_est <- theta_aipw  
+aipw_se <- se_aipw
+
+# --- DoubleML PLR results 
+dml_plr_est <- dml_plr_obj$coef
+dml_plr_se  <- dml_plr_obj$se
+
+# --- DoubleML AIPW results (from IRM model) 
+dml_aipw_est <- dml_irm_obj$coef
+dml_aipw_se  <- dml_irm_obj$se
+
+# --- Table of all estimates and standard errors 
+tbl_coef <- tibble(
+  estimator = c(
+    "PLR (Manual)",
+    "AIPW (Manual)",
+    "PLR (DoubleML)",
+    "AIPW (DoubleML)"
+  ),
+  coef = c(
+    plr_est,
+    aipw_est,
+    dml_plr_est,
+    dml_aipw_est
+  ),
+  se = c(
+    plr_se,
+    aipw_se,
+    dml_plr_se,
+    dml_aipw_se
+  )
+)
+
+# --- Plot ---
+ggplot(tbl_coef, aes(x = estimator, y = coef, ymin = coef - 1.96 * se, ymax = coef + 1.96 * se)) +
+  geom_point(size = 2, color = "steelblue") +
+  geom_errorbar(width = 0.2, color = "darkred") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  ylab("Coef") +
+  xlab("Estimator") + theme_minimal() +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1)) +
+  expand_limits(y = range(tbl_coef$coef + 2 * tbl_coef$se, tbl_coef$coef - 2 * tbl_coef$se))
+
+
+print(tbl_coef)
+```
+
+Based on this plotting we can see all of our 4 computed effect size is almost same.
+
+1.  AIPW is 5.55 for both manual and package estimation. Difference of t_value is 2 but the standard error and p_value(close to 0) is same and significant.
+2.  For the partially linear model, the two ATE estimates differ by only 0.02 (5.57 vs. 5.55). Although the t-values differs by about 10 , the standard errors and p-values remain almost identical and indicate similarly robust significance.
+
+## **4. ATE of Notification Opened via DoubleML**
+
+```{r}
+# Load required packages
+library(DoubleML)
+library(mlr3)
+library(mlr3learners)
+library(data.table)
+library(tidyverse)
+
+# Suppress mlr3 messages
+lgr::get_logger("mlr3")$set_threshold("warn")
+
+# Convert your dataset to data.table (required by DoubleML)
+df_dt <- as.data.table(df)
+
+# Ensure binary variables are numeric (0/1)
+df_dt[, notification_opened := as.numeric(as.character(notification_opened))]
+df_dt[, pop_up_rem := as.numeric(as.character(pop_up_rem))]
+
+# Select features: all X variables (excluding treatment, instrument, outcome)
+x_vars <- setdiff(colnames(df_dt), c("engagement", "notification_opened", "pop_up_rem"))
+
+# Define DoubleML data object
+dml_data <- DoubleMLData$new(
+  data = df_dt,
+  y_col = "engagement",
+  d_cols = "notification_opened",
+  z_cols = "pop_up_rem",
+  x_cols = x_vars
+)
+
+# Define learners
+lrn_g <- lrn("regr.ranger")
+lrn_m <- lrn("classif.ranger", predict_type = "prob")
+lrn_r <- lrn("classif.ranger", predict_type = "prob")
+
+# Initialize DoubleMLIIVM object
+dml_iivm <- DoubleMLIIVM$new(
+  data = dml_data,
+  ml_g = lrn_g,
+  ml_m = lrn_m,
+  ml_r = lrn_r,
+  n_folds = 5,
+  trimming_threshold = 0.01
+)
+
+# Fit the model
+set.seed(123)
+dml_iivm$fit()
+
+# Print summary
+dml_iivm$summary()
+
+```
+
+We found an **ATE of 9.0094** which is pretty large than our previous ATE which is so obvious as our endogenous variable is notifications_opened now. Additionally small Std error and p value makes this calculation more significant.
+
+### IV Manual computation
+
+```{r}
+
+# Extraction from fitted DoubleMLIIVM
+psi_a <- dml_iivm$psi_a
+psi_b <- dml_iivm$psi_b
+n     <- length(psi_a)
+
+# IV estimate 
+theta_iv <- -mean(psi_b) / mean(psi_a)
+
+# Efficient score 
+psi       <- psi_b - theta_iv * psi_a
+
+# Standard error, t‐stat and p‐value
+se_iv <- sd(psi) / sqrt(n)
+t_iv  <- theta_iv / se_iv
+p_iv  <- 2 * (1 - pnorm(abs(t_iv)))
+
+cat("Manual IV Results:::\n")
+cat("ATE:   ", round(theta_iv, 4), "\n")
+cat("Std Error:         ", round(se_iv, 4), "\n")
+cat("t-value:    ", round(t_iv, 4), "\n")
+cat("p-value:    ", format.pval(p_iv, 4), "\n")
+
+
+```
+
+After extracting psi_a and psi_b we used manual formula and estimated the output that we got previously. We got the same **ATE=9.009minutes.** While ATE is consistent, the SE, P_value is more smaller and t-value is more bigger which makes our estimation significant than the result of doubleml package.
+
+## **5. Heterogeneous Treatment Effects of Notification Sent**
+
+### Estimate group ATEs by gender (M/F) and by tertiles of past_engagement.
+
+```{r}
+# Male
+male_df <- subset(df, gender == "Male")
+male_ate <- lm(engagement ~ pop_up_rem, data = male_df)
+cat("Male ATE \n") 
+summary(male_ate)
+
+# Female
+female_df <- subset(df, gender == "Female")
+female_ate <- lm(engagement ~ pop_up_rem, data = female_df)
+cat("Female ATE \n") 
+summary(female_ate)
+
+##tertilles of past engagement
+
+cat("%-----tertiles of past engagemen----- %\n") 
+library(estimatr)
+
+df <- df %>%
+  mutate(
+    engage_tertile = factor(
+      ntile(past_engagement,3),
+      levels = 1:3,
+      labels = c("Low","Mid","High")
+    )
+  )
+
+# Interaction regression
+gate_engage <- lm_robust(
+  engagement ~ pop_up_rem * engage_tertile,
+  data = df
+)
+summary(gate_engage)
+
+
+```
+
+### Individualized ATEs with a Causal Forest.
+
+```{r}
+
+library(grf)
+
+# 1) Prepare outcome, treatment and covariates
+Y <- df$engagement
+W <- df$notification_sent
+
+# One-hot encode and drop intercept:
+X <- model.matrix(~ . - engagement - notification_sent, data = df)[, -1]
+
+# 2) Fit the causal forest
+set.seed(123)
+cf_model <- causal_forest(
+  X, Y, W,
+  num.trees       = 2000,             
+  sample.fraction = 0.5,              
+  mtry            = floor(ncol(X)/3), 
+  min.node.size   = 5,                
+  honesty         = TRUE              )
+
+# 3) Estimate the overall ATE
+ate_cf <- average_treatment_effect(cf_model, target.sample = "all")
+cat("Causal Forest ATE:", round(ate_cf[1], 4),
+    " (SE =", round(ate_cf[2], 4), ")\n")
+
+# 4) Predict individual CATEs (IATEs)
+tau_hat <- predict(cf_model, newdata = X)$predictions
+df$iate_cf <- tau_hat
+
+# 5) Summarize and visualize
+summary(tau_hat)
+hist(tau_hat,
+     breaks = 30,
+     main   = "Causal Forest IATEs",
+     xlab   = "Estimated Treatment Effect")
+
+
+
+```
+
+### Splitting data set by 80/20
+
+```{r}
+set.seed(123)              
+n     <- nrow(df)          
+i_tr  <- sample(n, 0.8*n)  # 80% of indices
+
+Train <- df[i_tr, ]        # 80% training data
+Test  <- df[-i_tr, ]       # remaining 20% test data
+# print(n)
+# print(Train, Test)
+```
+
+### Predict Individualized ATEs by implementing the R-Learner as weighted minimization problem.
+
+```{r}
+
+library(grf)
+
+# Specify your covariates
+covariates <- c(
+  "age","gender","region","device_type",
+  "app_version","sessions_per_day","past_engagement",
+  "notification_sent","notification_opened"
+)
+
+# Build X, W, Y on train
+X_train <- model.matrix(~ . - 1, data = Train[, covariates])
+W_train <- Train$pop_up_rem
+Y_train <- Train$engagement
+
+# 2. Estimate nuisances on Train
+# 2a) Propensity e_hat(X)
+ps_mod   <- glm(W_train ~ X_train, family = binomial)
+e_hat_tr <- predict(ps_mod,   type = "response")
+
+# 2b) Baseline outcome μ_hat(X)
+mu_forest  <- regression_forest(X_train, Y_train)
+mu_hat_tr  <- predict(mu_forest)$predictions
+
+# 3. Form pseudo‐outcome and weights
+pseudo_R <- (Y_train - mu_hat_tr) / (W_train - e_hat_tr)
+wt_R     <- (W_train - e_hat_tr)^2
+
+# 4. Fit the R‐Learner via weighted regression forest
+rlearner_forest <- regression_forest(
+  X_train,
+  pseudo_R,
+  sample.weights = wt_R
+)
+
+# 5. Extract in‐sample IATEs on 80% (for Task 5)
+tau_r_train <- predict(rlearner_forest, X_train)$predictions
+# 6. Compute and print the overall ATE
+ate_r_train <- mean(tau_r_train)
+cat("R-Learner In-Sample ATE:", round(ate_r_train, 3), "\n")
+
+# 7. Look at the distribution of IATEs
+print(summary(tau_r_train))
+
+```
+
+### Predict Individualized ATEs by implementing the DR-Learner.
+
+```{r}
+
+#  Propensity via logistic regression
+prop_mod  <- glm(pop_up_rem ~ age + gender + region + device_type +
+                   app_version + sessions_per_day + past_engagement +
+                   notification_sent + notification_opened,
+                 data = Train, family = binomial)
+Train$e_hat <- predict(prop_mod, type = "response")
+
+#  2b) Outcome regressions m0 and m1
+m0_mod    <- lm(engagement ~ age + gender + region + device_type +
+                  app_version + sessions_per_day + past_engagement +
+                  notification_sent + notification_opened,
+                data = Train, subset = (pop_up_rem == 0))
+m1_mod    <- lm(engagement ~ age + gender + region + device_type +
+                  app_version + sessions_per_day + past_engagement +
+                  notification_sent + notification_opened,
+                data = Train, subset = (pop_up_rem == 1))
+
+Train$mu0_hat <- predict(m0_mod, newdata = Train)
+Train$mu1_hat <- predict(m1_mod, newdata = Train)
+
+#  Form the DR pseudo‐outcome
+Train$dr_pseudo <- with(Train,
+  mu1_hat - mu0_hat
+  + (pop_up_rem   * (engagement - mu1_hat)) / e_hat
+  - ((1 - pop_up_rem) * (engagement - mu0_hat)) / (1 - e_hat)
+)
+
+#  Final CATE model: regress dr_pseudo on X
+tau_mod <- lm(dr_pseudo ~ age + gender + region + device_type +
+                app_version + sessions_per_day + past_engagement +
+                notification_sent + notification_opened,
+              data = Train)
+
+#  In-sample IATEs on your 80 %
+Train$tau_dr_train <- predict(tau_mod, newdata = Train)
+
+#  Summaries
+ate_dr_train <- mean(Train$tau_dr_train)
+cat("DR-Learner In-Sample ATE:", round(ate_dr_train,3), "\n")
+summary(Train$tau_dr_train)
+hist(Train$tau_dr_train,
+     main = "DR-Learner In-Sample IATEs",
+     xlab = "Estimated CATE (minutes)")
+```
+
+### Descriptive statistics with plotting
+
+```{r}
+# compute your three IATE vectors
+cf   <- tau_hat                # from causal_forest
+rl   <- tau_r_train            # from R-Learner
+dr   <- Train$tau_dr_train     # from DR-Learner
+
+# set up common x‐range
+xlim <- range(cf, rl, dr)
+
+# plot CF
+hist(cf, breaks = 30, xlim = xlim, probability = TRUE,
+     col = rgb(0, 0, 1, 0.4), border = NA,
+     main = "Overlapping IATE Densities", xlab = "IATE")
+
+# add R-Learner
+hist(rl, breaks = 30, probability = TRUE, add = TRUE,
+     col = rgb(0, 1, 0, 0.4), border = NA)
+
+# add DR-Learner
+hist(dr, breaks = 30, probability = TRUE, add = TRUE,
+     col = rgb(1, 0, 0, 0.4), border = NA)
+
+legend("topright",
+       legend = c("Causal Forest", "R-Learner", "DR-Learner"),
+       fill   = c(rgb(0,0,1,0.4),
+                  rgb(0,1,0,0.4),
+                  rgb(1,0,0,0.4)),
+       border = NA)
+
+
+```
+
+## 6. **HTE Evaluation**
+
+### Causal Forest IATEs with the Rank-weighted Average Treatment Effect (RATE)
+
+### DR-Learner trained above for the rest 20% dataset
+
+```{r}
+# 1. Propensity & outcome predictions on Test (no re‐fit)
+Test$e_hat   <- predict(prop_mod, newdata = Test, type = "response")
+Test$mu0_hat <- predict(m0_mod,  newdata = Test)
+Test$mu1_hat <- predict(m1_mod,  newdata = Test)
+
+# 2. Build the DR pseudo‐outcome on Test
+Test$dr_pseudo <- with(Test,
+  mu1_hat - mu0_hat
+  + (pop_up_rem * (engagement - mu1_hat)) / e_hat
+  - ((1 - pop_up_rem) * (engagement - mu0_hat)) / (1 - e_hat)
+)
+
+# 3. Predict IATEs for the 20% hold-out
+Test$tau_dr_test <- predict(tau_mod, newdata = Test)
+
+# 4. Summarize
+cat("DR-Learner OOS ATE:", round(mean(Test$tau_dr_test),3), "\n")
+summary(Test$tau_dr_test)
+hist(Test$tau_dr_test,
+     main = "DR-Learner Out-of-Sample IATEs",
+     xlab = "Estimated CATE (minutes)")
+
+
+```
+
+## 7. Optimal policy learning
+
+### Classification tree to learn an optimal treatment policy of whom should be sent a push notification.
+
+```{r}
+# Load required packages
+library(mlr3)
+library(mlr3learners)
+library(tidyverse)
+library(rpart.plot)
+# Get and transform the individual ATEs (pseudo-outcomes)
+df$ate_i   <- dml_irm_obj[["psi_b"]]
+df$sign    <- sign(df$ate_i)
+df$weights <- abs(df$ate_i)
+
+# Optimal Policy Learning with Classification Tree
+df_sub <- df %>%
+  select(
+    sign, weights, age, gender, region, device_type,
+    app_version, sessions_per_day, past_engagement,
+    notification_sent, notification_opened
+  ) %>%
+  mutate(
+    gender      = factor(gender),
+    region      = factor(region),
+    device_type = factor(device_type)
+  )
+
+task <- as_task_classif(df_sub, target = "sign")
+task$set_col_roles("weights", roles = "weights_learner")
+# Increase tree complexity to allow splits, including by age
+lrnr <- lrn("classif.rpart", cp = 1e-04, minsplit = 10, maxdepth = 5)
+lrnr$train(task)
+rpart.plot(lrnr$model)
+
+# Compute policy assignment pi = {-1,1}
+df_sub$pi <- 2 * (as.numeric(lrnr$predict(task)$response) - 1.5)
+
+# Classification Analysis
+covariate_matrix <- model.matrix(
+  ~ age + app_version + sessions_per_day + past_engagement + notification_sent + notification_opened
+    + gender + region + device_type - 1,
+  data = df_sub
+)
+
+# Compute CLAN: group-level means of each numeric covariate
+CLAN <- rbind(
+  No_Reminder = colMeans(covariate_matrix[df_sub$pi == -1, ], na.rm = TRUE),
+  Reminder    = colMeans(covariate_matrix[df_sub$pi ==  1, ], na.rm = TRUE)
+)
+
+# Transpose for readability and round
+CLAN <- round(t(CLAN), 2)
+CLAN
+
+```

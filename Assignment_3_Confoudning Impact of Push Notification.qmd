@@ -1,0 +1,668 @@
+---
+title: "Confounded Impact of Push Notifications"
+author: "MD SAMIUL HAUQUE CHOWDHURY"
+format:
+  pdf:
+    toc: true           
+    toc-depth: 2        
+    number-sections: true
+editor: visual
+---
+
+## 1. Conditional Outcome Regression:
+
+### Data Set Description
+
+```{r}
+my_data <- read.csv("data_fitness.csv")
+
+head(my_data, 5)
+```
+
+We can see an overview of our data-set and all the variables here.
+
+Treatment Variable = notification_sent
+
+Covariates = past_engagement, age, gender, region, device_type, app_version, sessions_per_day
+
+Instrument Variable = pop_up_rem
+
+Outcome Variable = engagement
+
+### Conditional outcome regression
+
+```{r}
+model <- lm(engagement ~ notification_sent + past_engagement + age + gender + region + device_type + app_version + sessions_per_day, 
+            data = my_data)
+summary(model)
+
+
+```
+
+We get **7.04 minutes** more engagement for users who received notification while adjusting for all the other covariates(age, genderMale, regionEU, regionUS, device_typeiOS, app_version, sessions_per_day).
+
+## 2. Propensity Score Matching
+
+```{r}
+library(MatchIt)
+
+
+# 1:1 nearest-neighbor matching using Mahalanobis distance for ATT
+match_1v1 <- matchit(
+  notification_sent ~ past_engagement + age + gender + region + device_type + app_version + sessions_per_day,
+  data = my_data,
+  method = "nearest",
+  distance = "mahalanobis",
+  ratio = 1,
+  replace = TRUE,
+  estimand = "ATT"
+)
+
+# Check matching balance summary
+summary(match_1v1)
+
+# Extract the matched dataset for later analysis
+df_att_1 <- match.data(match_1v1)
+
+
+
+```
+
+```{r}
+library(MatchIt)
+
+# 1:3 nearest-neighbor matching using Mahalanobis distance for ATT
+match_1v3 <- matchit(
+  notification_sent ~ past_engagement + age + gender + region + device_type + app_version + sessions_per_day,
+  data = my_data,
+  method = "nearest",
+  distance = "mahalanobis",
+  ratio = 3,
+  replace = TRUE,
+  estimand = "ATT"
+)
+
+# Check matching balance summary
+summary(match_1v3)
+
+# Extract matched dataset for further analysis
+df_att_3 <- match.data(match_1v3)
+
+
+```
+
+### Table 1:1
+
+```{r}
+library(cobalt)
+
+# for both before and after matching.
+bal.tab(match_1v1, un = TRUE, stats = c("m", "diff", "p"))
+
+# To save this table to a variable for further manipulation or export, you can do:
+balance_table <- bal.tab(match_1v1, un = TRUE, stats = c("m", "diff", "p"))
+```
+
+After adjustment the mean difference dropped in 0.118 for past_engagement. On the other hand, for rest of the covariates its almost 0. At this point, we can say, 1:1 matching is pretty balanced.
+
+### Table 1:3
+
+```{r}
+library(cobalt)
+
+# for both before and after matching.
+bal.tab(match_1v3, un = TRUE, stats = c("m", "diff", "p"))
+
+# To save this table to a variable for further manipulation or export, you can do:
+balance_table <- bal.tab(match_1v3, un = TRUE, stats = c("m", "diff", "p"))
+```
+
+Here difference did not dropped as 1:1 but 0.163 is a good number. Other covariates are also near to 0 but still we can say 1:1 is more balanced than 1:3.
+
+### Love Plot - 1:1
+
+```{r}
+library(cobalt)
+# Print covariate balance table
+bal.tab(match_1v1, un = TRUE, m.threshold = 0.1)
+
+love.plot(match_1v1, 
+          threshold = 0.1, 
+          var.order = "unadjusted", 
+          stat = "mean.diffs",
+          abs = TRUE,
+          line = TRUE)
+```
+
+We can see all the points are staying closer to each other except past engagement. All the points are staying inside the threshold or nearby threshold after the adjustment. Other than that we can say it is not so balanced.
+
+### Love Plot - 1:3
+
+```{r}
+library(cobalt)
+# Print covariate balance table
+bal.tab(match_1v3, un = TRUE, m.threshold = 0.1)
+
+love.plot(match_1v3, 
+          threshold = 0.1, 
+          var.order = "unadjusted", 
+          stat = "mean.diffs",
+          abs = TRUE,
+          line = TRUE)
+```
+
+In 1:3 matching, after adjustment we can see a slight more distant than 1:1. Still Past engagement is the only variable that is staying outside of the threshold and it is pretty far from 0 which makes 1:3 matching more inferior.
+
+### ATT — (1:1)
+
+```{r}
+# For 1:1 we can resue the previous variable df_att_1 to calculate ATT
+mod_att <- lm(engagement ~ notification_sent, data = df_att_1, weights = weights)
+summary(mod_att)
+```
+
+```{r}
+# Matching for ATC
+library(MatchIt)
+match_atc <- matchit(
+  notification_sent ~ past_engagement + age + gender + region + device_type + app_version + sessions_per_day,
+  data = my_data,
+  method = "nearest",
+  distance = "logit",
+  ratio = 1,
+  replace = TRUE,
+  estimand = "ATC"
+)
+
+# Use matched data
+df_atc <- match.data(match_atc)
+
+# Estimate ATC
+mod_atc <- lm(engagement ~ notification_sent, data = df_atc, weights = weights)
+summary(mod_atc)
+
+```
+
+### ATE - 1:1
+
+```{r}
+# Number of treated and control observations in original data
+n_treated <- sum(my_data$notification_sent == 1)
+n_control <- sum(my_data$notification_sent == 0)
+
+# Compute weighted ATE
+ATE <- weighted.mean(c(coef(mod_att)[2], coef(mod_atc)[2]), c(n_treated, n_control))
+summary(ATE)
+
+```
+
+### ATT — (1:3)
+
+```{r}
+
+# Estimate ATT
+mod_att_1v3 <- lm(engagement ~ notification_sent, data = df_att_3, weights = weights)
+summary(mod_att_1v3)
+
+```
+
+```{r}
+# 1:3 matching for ATC
+match_atc_1v3 <- matchit(
+  notification_sent ~ past_engagement + age + gender + region + device_type + app_version + sessions_per_day,
+  data = my_data,
+  method = "nearest",
+  distance = "mahalanobis",
+  ratio = 3,
+  replace = TRUE,
+  estimand = "ATC"
+)
+
+# Matched data
+df_atc_1v3 <- match.data(match_atc_1v3)
+
+# Estimate ATC
+mod_atc_1v3 <- lm(engagement ~ notification_sent, data = df_atc_1v3, weights = weights)
+summary(mod_atc_1v3)
+
+```
+
+### ATE - 1:3
+
+```{r}
+# Number of treated and control in original data
+n_treated <- sum(my_data$notification_sent == 1)
+n_control <- sum(my_data$notification_sent == 0)
+
+# Compute ATE from 1:3 matched ATT and ATC
+ATE_1v3 <- weighted.mean(
+  c(coef(mod_att_1v3)[2], coef(mod_atc_1v3)[2]),
+  c(n_treated, n_control)
+)
+summary(ATE_1v3)
+
+```
+
+Here comparing between the ATE we can ATE(1:1)=7.263 vs ATE(1:3)=7.595 and ATT(1:1)= 7.747 vs ATT(1:3)=8.017 we can say 1:3 provides slight better result. However If we consider multiple R-sqr, Adj R-sqr and residual SE then 1:1 has lower errors hence being smaller in effect but still the values are significant.
+
+## 3. **Inverse Probability Weighting**
+
+### Stabilized Weight
+
+```{r}
+# install.packages("WeightIt") 
+library(WeightIt)
+
+# Estimating stabilized weights using logistic regression
+wt <- weightit(
+  notification_sent ~ past_engagement + age + gender + region + device_type + app_version + sessions_per_day,
+  data = my_data,
+  method = "ps",              # Propensity score method
+  estimand = "ATE",           # Or "ATT" if desired
+  stabilize = TRUE            # This enables stabilized weights
+)
+
+# Adding stabilized weights to the dataset
+my_data$sw <- wt$weights
+
+# Check summary of the weights
+summary(my_data$sw)
+
+
+
+```
+
+Here in this part, we have estimated weight on propensity score. We did stabilize=TRUE to compute stabilized weights.
+
+### Covariate Balance
+
+```{r}
+library(WeightIt)
+library(cobalt) # Still needed for bal.tab and love.plot
+library(knitr)
+library(dplyr)
+
+# 1. Create treatment formula (same as before)
+treat_formula <- notification_sent ~ past_engagement + age + gender + region + device_type + app_version + sessions_per_day
+
+
+w.out <- weightit(
+  formula = treat_formula,
+  data = my_data,
+  method = "ps", 
+  estimand = "ATE", 
+  stabilize = TRUE 
+)
+
+bal <- bal.tab(
+  w.out, 
+  un = TRUE 
+)
+
+
+bal_df <- bal$Balance %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Covariate") %>%
+  select(Covariate, Diff.Un, Diff.Adj, everything()) 
+
+kable(bal_df, digits = 3)
+
+
+```
+
+We can see a good the balance is done before and after we have adjusted weights. Moreover,
+
+-   If we compare it 1:1 and 1:3 we would see a huge difference in it. After adjustment the values went below 0 but still so close to 0. That is a pretty good balance we can say.
+
+-   past_engagement was a problem in propensity score matching as it was 0.11 & 0.16 before which also came close to 0 after adding weights.
+
+### Love plot
+
+```{r}
+love.plot(
+  bal,
+  threshold = 0.1,
+  abs = TRUE,
+  line = TRUE,
+  stars = "raw",
+  var.order = "unadjusted"
+)
+
+
+```
+
+As we described earlier how good the balance is after we added weights to covariates. We can see our covariates are lying inside the threshold and close to 0.
+
+### Weighted regression with IPW using Formula:
+
+```{r}
+library(dplyr)
+
+
+# Step 1: Estimate propensity scores using logistic regression
+prop_model <- glm(notification_sent ~ past_engagement + age + gender + region + device_type + app_version + sessions_per_day,
+                  family = binomial(link = "logit"),
+                  data = my_data)
+
+# Add predicted propensity scores to the dataset
+my_data$propensity <- predict(prop_model, type = "response")
+
+# Step 2: Calculate inverse probability weights
+my_data <- my_data |>
+  mutate(ipw = (notification_sent / propensity) + ((1 - notification_sent) / (1 - propensity)))
+
+# Optional: check distribution of weights
+summary(my_data$ipw)
+
+# Step 3: Run weighted regression of engagement on treatment
+model_ipw <- lm(engagement ~ notification_sent, data = my_data, weights = ipw)
+summary(model_ipw)
+
+```
+
+After weighted regression we get **6.934 minutes**. We compare this with:
+
+1.  **CATE**: It was 7.04minutes in CATE but after weighted regression it came to 6.934. Its lower but it has less biases as we used weights.
+2.  **ATE(1:1, 1:3):** It was 7.263 and 7.594 respectively after propensity score matching. In that case also the value was lower.
+
+In terms of **p-value: \< 2.2e-16** which is **almost 0** we can say. And based on this we can say that our result here is robust & statistically significant.
+
+## 4. **Double-robust Estimation**
+
+### Outcome Model
+
+```{r}
+# Outcome model: E[Y | T, X]
+outcome_model <- lm(engagement ~ notification_sent + past_engagement + age + gender + region + device_type + app_version + sessions_per_day,
+                    data = my_data)
+
+# Predict potential outcomes
+my_data$mu1 <- predict(outcome_model, newdata = transform(my_data, notification_sent = 1))
+my_data$mu0 <- predict(outcome_model, newdata = transform(my_data, notification_sent = 0))
+
+```
+
+### Propensity Model
+
+```{r}
+# Propensity model: P(T=1|X)
+prop_model <- glm(notification_sent ~ past_engagement + age + gender + region + device_type + app_version + sessions_per_day,
+                  family = binomial(link = "logit"),
+                  data = my_data)
+
+# Propensity scores
+my_data$propensity <- predict(prop_model, type = "response")
+
+```
+
+```{r}
+head(my_data[, c("mu1", "mu0")])
+
+```
+
+### Doubly Robust ATE:
+
+The formula we must need to use here below,
+
+![](images/clipboard-2334000822.png){width="757"}
+
+```{r}
+# Doubly Robust ATE using Formula 1
+
+dr_ate_1 <- mean(
+  (my_data$notification_sent * (my_data$engagement - my_data$mu1) / my_data$propensity) -
+  ((1 - my_data$notification_sent) * (my_data$engagement - my_data$mu0) / (1 - my_data$propensity)) +
+  (my_data$mu1 - my_data$mu0)
+)
+
+print(dr_ate_1)
+
+```
+
+```{r}
+# Doubly Robust ATE using Formula 2
+
+dr_ate_formula_2_code <- mean(
+  (my_data$notification_sent * my_data$engagement / my_data$propensity) -
+  ((1 - my_data$notification_sent) * my_data$engagement / (1 - my_data$propensity)) -((my_data$notification_sent - my_data$propensity) / my_data$propensity) * my_data$mu1 + ((my_data$propensity - my_data$notification_sent) / (1 - my_data$propensity)) * my_data$mu0
+)
+
+print(dr_ate_formula_2_code)
+```
+
+**Interpretation Summary:**
+
+So far we build an outcome model and propensity model and based on their probability we computed double robust estimation. In the slide there two formula given which was implemented in R with the help of some AI agent(gemini). Interestingly both of the formula gave us same result which is **7.11 more minutes** engagement to the app.
+
+We can rely on this result more than our previous results because we used two models here both the 1. Outcome & 2. Propensity. We know that this ATE=7.11 is consistent even if only one**(1 or 2)** model is correctly specified.
+
+After computing IPW weighted regression our ATE was 6.934, here it creased slightly better.
+
+### Bootstrap:
+
+```{r}
+library(dplyr)
+library(tibble)
+
+compute_dr_ate <- function(data) {
+  # Propensity‐score
+  ps <- predict(
+    glm(notification_sent ~ past_engagement + age + gender +
+        region + device_type + app_version + sessions_per_day,
+        family = binomial(), data = data),
+    type = "response"
+  )
+  # Outcome regressions
+  mu0 <- predict(
+    lm(engagement ~ past_engagement + age + gender +
+       region + device_type + app_version + sessions_per_day,
+       data = filter(data, notification_sent == 0)),
+    newdata = data
+  )
+  mu1 <- predict(
+    lm(engagement ~ past_engagement + age + gender +
+       region + device_type + app_version + sessions_per_day,
+       data = filter(data, notification_sent == 1)),
+    newdata = data
+  )
+  # Doubly‐robust estimate
+  dr <- (mu1 - mu0) +
+        ifelse(data$notification_sent == 1,
+               (data$engagement - mu1) / ps,
+               (data$engagement - mu0) / (1 - ps))
+  mean(dr)
+}
+
+
+bootstrap_dr <- function(data, B = 1000, seed = 123) {
+  set.seed(seed)
+  ate   <- compute_dr_ate(data)
+  boot  <- replicate(
+    B,
+    compute_dr_ate(data[sample(nrow(data), replace = TRUE), ])
+  )
+  se    <- sd(boot)
+  t_val <- ate / se
+  p_val <- 2 * (1 - pnorm(abs(t_val)))
+  tibble(ATE = ate, SE = se, t_value = t_val, p_value = p_val)
+}
+
+# Run and view results
+results <- bootstrap_dr(my_data, B = 1000)
+print(results)
+
+```
+
+Here in this bootstrap method we used our double robust entire procedure (models, predictions, DR) inside this code and re-run this function 1000 times which eventually gave us value ATE=6.988 or **6.99.** Which is pretty closed to our DR-estimation.
+
+But at that point we can more strongly claim that our **ATE is being more bias free and robust**.
+
+## 5. **Sensitivity Analysis to Unobserved Confounding**
+
+```{r}
+# Load necessary packages
+library(sensemakr)
+
+# Fit conditional outcome regression model
+model <- lm(engagement ~ notification_sent + past_engagement + age + gender + region + device_type + app_version + sessions_per_day,
+            data = my_data)
+
+# Run sensemakr sensitivity analysis
+sensitivity <- sensemakr(
+  model = model,
+  treatment = "notification_sent",
+  benchmark_covariates = c("past_engagement"),  # you can change or add more
+  kd = 1:3
+)
+
+# Display sensitivity analysis summary
+summary(sensitivity)
+
+# Optional: visualize sensitivity
+plot(sensitivity)
+
+```
+
+Based on this graph, we can say, the treatment effect would be reduced to 2.35 from the original(7.03) if there is an unobserved confounder is as strong as past_engagement.
+
+### Unobserved Confounders
+
+1.  **Motivation**: Motivation is a good confounder. Positively motivated people would still use the app despite the notification where opposite can also happen.
+2.  **Weather**: It can be a significant confounder as user with good motivation might not be able to go out if it's raining or snowing outside. Importantly they can engage indoor activities but still it influence users behavior. Oppositely a good weather can motivate users to go out for a run.
+3.  **Time-period**: There are some specific time(on the basis of year, week, day) period when users are quite busy with their professional or social life. It has a massive sinfulness on users schedule.
+4.  **Socio-Economic-Status**: Level of education, occupation, Income level has a good relation for this confounder. For example, a person working in warehouse might need sleep more than going out for a run where as a Software engineer will think exactly opposite.
+
+## 6. **Instrumental-variable Estimation**
+
+### LATE
+
+```{r}
+# Manual LATE (ignoring covariates)
+ITT <- mean(my_data$engagement[my_data$pop_up_rem == 1]) - 
+       mean(my_data$engagement[my_data$pop_up_rem == 0])
+
+first_stage <- mean(my_data$notification_opened[my_data$pop_up_rem == 1]) - 
+               mean(my_data$notification_opened[my_data$pop_up_rem == 0])
+
+LATE_manual <- ITT / first_stage
+
+# Print results
+ITT
+first_stage
+LATE_manual
+
+```
+
+In LATE here we are using our IV(instrument variable) and hence it gave us a result 7.06. What we can say, this is the average engagement of users who opened the notification because they have received the pop_up_rem.
+
+### Two-stage least squares (2SLS)
+
+### Without Covariates
+
+```{r}
+# Load the necessary package
+library(AER)
+
+# 2SLS regression WITHOUT covariates
+model_2sls_simple <- ivreg(
+  engagement ~ notification_opened | pop_up_rem,
+  data = my_data
+)
+
+# Summarize the model with robust standard errors
+summary(model_2sls_simple, vcov = vcovHC)
+
+```
+
+### With Covariates
+
+```{r}
+library(AER) 
+#With covariates
+model_2sls_cov <- ivreg(
+  engagement ~ notification_opened + past_engagement + age + gender + region + device_type + app_version + sessions_per_day |
+  pop_up_rem + past_engagement + age + gender + region + device_type + app_version + sessions_per_day,
+  data = my_data
+)
+summary(model_2sls_cov, vcov = vcovHC)
+
+```
+
+In order to show the difference between two outputs precisely we can sort this data into a table.
+
+| Output | Without Covariates | With Covariates | Interpretation |
+|---------------|---------------|---------------|-----------------------------|
+| Effect of notifications_opened | 9.3457, SE=0.809 | 8.5118, SE=0.606 | Slightly reduced effect after adjusting but highly significant(smaller SE). |
+| Residual Std. Error | 7.727 | 5.733 | Residual variance is lower with covariates. |
+| R-squared | 0.3408 | 0.6374 | Model explains more variance when covariates are included. |
+| P-value | P\< 2.2e-16 | P\< 2.2e-16 | Significant P value as it is extremely small. |
+
+### First Stage
+
+```{r}
+# Without covariates
+first_stage_simple <- lm(notification_opened ~ pop_up_rem, data = my_data)
+
+# With covariates
+first_stage_cov <- lm(notification_opened ~ pop_up_rem + past_engagement + age + gender + region + device_type + app_version + sessions_per_day,
+                      data = my_data)
+
+summary(first_stage_cov)
+
+# Get predicted values from the first stage
+my_data$predicted_opened <- predict(first_stage_cov)
+
+```
+
+### Second Stage
+
+```{r}
+
+
+# Without covariates
+second_stage_simple <- lm(engagement ~ predict(first_stage_simple), data = my_data)
+
+# With covariates
+second_stage_cov <- lm(engagement ~ predicted_opened + past_engagement + age + gender + region + device_type + app_version + sessions_per_day,
+                       data = my_data)
+
+summary(second_stage_cov)
+
+```
+
+### Instrument Strength (2SLS diagnostics)
+
+```{r}
+library(AER)
+model_2sls <- ivreg(
+  engagement ~ notification_opened + past_engagement + age + gender + region + device_type + app_version + sessions_per_day |
+  pop_up_rem + past_engagement + age + gender + region + device_type + app_version + sessions_per_day,
+  data = my_data
+)
+
+summary(model_2sls, diagnostics = TRUE)
+
+
+```
+
+We can see an average engagement of 8.511minutes when our treatment variable is notifications_opened.
+
+## 7. Executive Summary
+
+### Key questions and findings:
+
+1.  Whether the treatment effect is more reliable/robust after applying propensity score matching?
+
+2.  Does weighting improve robustness further?
+
+3.  In Double robust we used both the outcome model and propensity model. In that case how significant the treatment effect compared to previous results?
+
+4.  Moreover we applied bootstrap method to re-run the same function 1000 times to get more robust effect size. Do we dare to rely the effect size.
+
+5.  Is there any unobserved confounders in our experiment?
+
+6.  After using instrument variable, how the effect size changes compared to previous result?
+
+    \- We can say after every phase the treatment effect was more robust than the previous one.
+
+In conclusion, we can clearly claim that the effect size we have got after using IV(T=notification_opened) is pretty large than all of our previous results. It is so obvious that the average engagement will be larger as our treatment variable is notification_opened. Its **(8.511/7.04)= 1.21** times larger than the **conditional outcome regression**, **1.17** larger than **1:1 propensity score matching**, **1.22** times larger than the **Weighted regression** and **1.21** times larger than the **bootstrap result**.

@@ -1,0 +1,427 @@
+---
+title: "Staggered Roll-out of a New Recommendation Algorithm"
+author: "MD SAMIUL HAUQUE CHOWDHURY"
+format:
+  pdf:
+    toc: true           
+    toc-depth: 2        
+    number-sections: true
+editor: visual
+---
+
+## 1. **Visualization of Staggered Roll‑Out and Watch Time**
+
+### Data set description
+
+```{r}
+df <- read.csv("streamflix.csv", stringsAsFactors = FALSE)
+head(df, 5)
+```
+
+### Visualization
+
+```{r}
+library(panelView)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+
+# Converting 'week' column to Date objects
+df$week <- ymd(df$week)
+
+# Converting 'country' to a factor
+df$country <- factor(df$country) # Corrected: Removed '$country' after df$country
+
+# Creating a numeric 'time' variable for panelView
+earliest_week <- min(df$week, na.rm = TRUE)
+df$numeric_week <- as.numeric(difftime(df$week, earliest_week, units = "weeks"))+1
+df$new_algo_deployed <- as.numeric(df$new_algo_deployed)
+
+
+# Panel Plot using panelView 
+panelview(
+  watch_time_per_user ~ new_algo_deployed, 
+  data = df,
+  index = c("country", "numeric_week"),    # Specify unit and time IDs using 'index'
+  xlab = "Weeks",
+  ylab = "Country",
+  cex.main = 1.2,
+  cex.lab = 7,
+  cex.axis = 4,
+  legend.labs = c("Control", "Treated"),
+  axis.lab.gap = c(1, 1)
+)
+```
+
+## 2. **Two-Way Fixed Effects (TWFE) Estimation**
+
+### Two-Way Fixed Effects model
+
+```{r}
+library(fixest)
+
+mod_twfe <- feols(
+  watch_time_per_user ~ new_algo_deployed + marketing_spend + avg_monthly_price + broadband_penetration | country + week,
+  cluster = ~ country + week,
+  data = df )
+
+summary(mod_twfe)
+
+```
+
+### Point estimate of the ATT and its SEs clustered by country & week.
+
+```{r}
+# Extracting coefficient (ATT) and clustered SE
+att <- coef(mod_twfe)["new_algo_deployed"]
+se <- sqrt(vcov(mod_twfe)["new_algo_deployed", "new_algo_deployed"])
+
+# Report as formatted text
+cat(sprintf("ATT : %.4f\n", att))
+cat(sprintf("Clustered SE: %.4f\n", se))
+
+#at 95% confidence interval
+lower <- att - 1.96 * se
+upper <- att + 1.96 * se
+cat(sprintf("95%% CI: [%.4f, %.4f]\n", lower, upper))
+
+```
+
+[**Weakness of TWFE:**]{.underline}
+
+The TWFE model assumes that all treated units are treated at the same time and that the treatment effect is the same across all units and time periods. In our setting, its staggered rollout, meaning the treatment is introduced at different times across different countries. This violates the TWFE assumption that all treated units receive the treatment at the same time. As a result, TWFE may compare already treated countries to newly treated ones, leading to biased results.
+
+## **3. Dynamic Two-Way Fixed Effects (Event Study) Estimation**
+
+### Dynamic Two-Way Fixed Effects / Event Studies model including the covariates.
+
+```{r}
+library(dplyr)
+
+# Create a numeric time index
+df <- df %>%
+  mutate(time = as.integer(as.factor(week)))
+
+# Get first treated week for each country
+first_treat <- df %>%
+  filter(new_algo_deployed == 1) %>%
+  group_by(country) %>%
+  summarise(treat_time = min(time))
+
+# Merge treatment timing into main data
+df <- df %>%
+  left_join(first_treat, by = "country") %>%
+  mutate(d_it_k = time - treat_time)
+
+df$d_it_k[is.na(df$treat_time)] <- NA
+
+
+#Event study model with covariates
+model_eventstudy <- fixest::feols(watch_time_per_user ~ i(d_it_k, ref = c(-1, Inf)) +
+                marketing_spend + avg_monthly_price + broadband_penetration
+              | country + time, data = df)
+summary(model_eventstudy)
+
+```
+
+### Dynamic treatment effects with 95% confidence bands
+
+```{r}
+library(fixest)
+
+iplot(
+  model_eventstudy,
+  ref.line = 0,                      
+  xlab = "Event time (k)",           # Label for x-axis
+  ylab = "Treatment effect",         # Label for y-axis
+  main = "Dynamic Treatment Effects with 95% CI"  # Plot title
+)
+
+
+```
+
+[**Weakness of dynamic TWFE (Event study):**]{.underline}
+
+The main limitation of the dynamic TWFE (event study) model in a staggered rollout setting is that it assumes the treatment has the same effect for all countries and at all times. In our case, the algorithm was introduced at different points in time across countries, but the model ignores this variation. It treats early-treated and late-treated units as if they are directly comparable, which can lead to biased result.
+
+## 4. **Callaway & Sant’Anna (2021) Estimation**
+
+### Callaway &  Sant’Anna (2021) estimator for staggered treatment timing including the covariates.
+
+```{r}
+library(did)
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+# Convert 'week' column to Date objects
+df$week <- ymd(df$week)
+
+df$country_id_numeric <- as.numeric(factor(df$country))
+
+# This portion of code is done with the help of some LLM to Create a numeric 'time' variable (weeks since earliest date).
+earliest_week <- min(df$week, na.rm = TRUE)
+df$numeric_week <- as.numeric(difftime(df$week, earliest_week, units = "weeks")) + 1
+
+df_processed <- df %>%
+  group_by(country_id_numeric) %>% 
+  mutate(
+    group = ifelse(
+      any(new_algo_deployed == 1),
+      min(numeric_week[new_algo_deployed == 1]),
+      Inf 
+    )
+  ) %>%
+  ungroup()
+# Ensure 'new_algo_deployed' is numeric (0 or 1)
+df_processed$new_algo_deployed <- as.numeric(df_processed$new_algo_deployed)
+
+
+
+#Callaway & Sant’Anna (2021) Model
+
+drdid_results <- att_gt(
+  yname = "watch_time_per_user",
+  tname = "numeric_week",
+  idname = "country_id_numeric", # Use the new numeric ID column
+  gname = "group",
+  xformla = ~ 1, # No covariates
+  data = df_processed,
+  allow_unbalanced_panel = TRUE,
+  control_group = "nevertreated",
+  anticipation = 0,
+  clustervars = "country_id_numeric",
+  est_method = "dr"
+)
+
+cat("\n Group-Time ATTs (ATT_gt) \n")
+print(drdid_results$att.egt)
+
+# Aggregate to get overall ATT
+overall_att <- aggte(drdid_results, type = "group")
+cat("\ nOverall ATT (Aggregated) \n")
+print(overall_att)
+
+# Aggregate to get dynamic effects (ATTs over time)
+dynamic_att <- aggte(drdid_results, type = "dynamic")
+cat("\n Dynamic ATTs (Aggregated over time) \n")
+print(dynamic_att)
+
+
+```
+
+## 5. Augmented **Synthetic Control for Staggered Adoption**
+
+### **Augmented Synthetic Control Method**
+
+```{r}
+library(augsynth)
+library(dplyr)
+
+# Panel prep (use exactly this block)
+panel <- df %>%
+  mutate(
+    country  = as.factor(country),
+    time_idx = as.integer(as.factor(week))
+  )
+
+# Augmented Synthetic Control on your data
+asyn <- augsynth(
+  watch_time_per_user ~ new_algo_deployed | marketing_spend + avg_monthly_price + broadband_penetration,
+  unit     = country,
+  time     = time_idx,
+  data     = panel,
+  progfunc = "Ridge",
+  scm      = TRUE,
+  fixedeff = TRUE,   # allow intercept shifts
+  alpha    = 0.5  #(partial pooling method)
+)
+
+# Results
+summary(asyn)
+plot(asyn)
+```
+
+[**Report:**]{.underline}
+
+-   Overall **ATT**: 460, **SE**:0.132
+
+-   Since 79% improvement (global) \> 55% improvement (individual), the algorithm was more successful at minimizing the pooled/global imbalance than the unit-specific imbalance.
+
+## 6. **Counterfactual Imputation Estimators**
+
+### Fixed Effects counterfactual estimator (FEct)
+
+```{r}
+library(fect)
+
+out_fe <- fect(
+  watch_time_per_user ~ new_algo_deployed + marketing_spend + avg_monthly_price + broadband_penetration,
+  data   = df,
+  index  = c("country","week"),  
+  method = "fe",                  
+  force  = "two-way",            
+  se     = TRUE, 
+  nboots = 200,                   
+  parallel = TRUE, 
+  cores    = 4
+)
+summary(out_fe)
+
+# plot results
+plot(
+  out_fe, 
+  main = "Estimated ATT (FEct)", 
+  ylab = "Effect of new_algo on watch_time/user",
+  cex.main = 0.8, cex.lab = 0.8, cex.axis = 0.8,
+  stats = "F.p"
+)
+
+```
+
+### Interactive Fixed Effects counterfactual estimator (iFEct)
+
+```{r}
+library(fect)
+
+out_ife <- fect(
+  watch_time_per_user ~ new_algo_deployed + marketing_spend + avg_monthly_price + broadband_penetration,
+  data   = df,
+  index  = c("country","week"),   
+  method = "ife",                 # interactive fixed effects
+  force  = "two-way",             
+  se     = TRUE, 
+  nboots = 200,                   
+  parallel = TRUE, 
+  cores    = 4,
+  CV       = TRUE,               
+  r        = c(0,5),              
+  criterion = "mspe"              
+)
+
+summary(out_ife)
+
+# plot results
+plot(
+  out_ife, 
+  main = "Estimated ATT (IFEct)", 
+  ylab = "Effect of new_algo on watch_time",
+  cex.main = 0.8, cex.lab = 0.8, cex.axis = 0.8,
+  stats = "F.p"
+)
+
+```
+
+-   The cross-validation has suggested latent factors r=0(0.10453).
+
+### Matrix Completion counterfactual estimator (MC)
+
+```{r}
+library(fect)
+
+out_mc <- fect(
+  watch_time_per_user ~ new_algo_deployed + marketing_spend + avg_monthly_price + broadband_penetration,
+  data   = df,
+  index  = c("country","week"),
+  method = "mc",
+  force  = "two-way",
+  se     = TRUE, 
+  nboots = 200,
+  parallel = TRUE, 
+  cores    = 4,
+  CV       = TRUE,
+  nlambda  = 10,
+  criterion = "mspe"
+)
+
+# report
+summary(out_mc)
+
+# chosen penalty (lambda*)
+out_mc$lambda.cv
+
+# plot results
+plot(
+  out_mc,
+  main = "Estimated ATT (MC)",
+  ylab = "Effect of New_algo/watch_time_/user",
+  cex.main = 0.8, cex.lab = 0.8, cex.axis = 0.8,
+  stats = "F.p"
+)
+
+```
+
+-   Cross‑validation suggested a nuclear‑norm penalty of λ = 1 (lambda.norm = 1.00000).
+
+[**Best Fit analysis:**]{.underline}
+
+The Matrix Completion (MC) model is best because it has the smallest error (MSPE = 0.10208). In cross-validation, λ = 1 gave the lowest prediction error, as a result, MC’s counterfactual predictions matched the pre-treatment outcomes more closely than FEct or iFEct.
+
+## **7. Parallel Trends Assumption**
+
+### Preferred model section:
+
+```{r}
+library(fect)
+
+out <- fect(
+  watch_time_per_user ~ new_algo_deployed + marketing_spend + avg_monthly_price + broadband_penetration,
+  data   = df,
+  index  = c("country","week"),
+  method = "ife",
+  se = TRUE
+)
+
+summary(out)
+
+
+
+
+```
+
+### Placebo test
+
+```{r, error=TRUE}
+ 
+library(fect)
+out_placebo <- fect(
+  watch_time_per_user ~ new_algo_deployed + marketing_spend + avg_monthly_price + broadband_penetration,
+  data   = df,
+  index  = c("country","week"),
+  method = "ife",
+  se     = TRUE,
+  placeboTest   = TRUE,
+  placebo.period = -10:-1   
+  # pick available pre-treatment periods
+)
+
+summary(out_placebo)
+plot(out_placebo, type = "placebo")
+
+```
+
+### Sensitivity analysis
+
+```{r, error=TRUE}
+devtools::install_github("xuyiqing/fect")
+
+```
+
+```{r, error=TRUE}
+library(fect)
+out_ife_placebo <- fect_sens(
+  fect.out      = out,               # model with placebo
+  post.periods  = 1:10,                    # focus on post-treatment periods
+  Mbarvec       = seq(0, 0.5, by = 0.05),  # Relative Magnitude restriction grid
+  periodMbarvec = c(0.15, 0.25),           # Period-specific restrictions
+  Mvec          = seq(0, 0.2, by = 0.02),  # Smoothness restriction grid
+  periodMvec    = c(0, 0.1),               # Period-specific smoothness
+  parallel      = FALSE
+)
+
+#plotting
+plot(out_ife_placebo,
+     type = "sens",
+     restrict = "rm",   # Relative Magnitude restriction
+     main = "Relative Magnitude Restriction for ATT")
+
+```
